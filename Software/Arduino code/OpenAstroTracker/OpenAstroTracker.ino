@@ -1,7 +1,7 @@
 /*
   =======================================================================================================================================
 
-    Version 1.5.10
+    Version 1.6
 
     1. Connect your Arduino, under tools choose "Arduino Uno", set the right Port and set "Arduino ISP" as the Programmer.
     2. Hit upload (Ctrl-U)
@@ -14,19 +14,27 @@
 
   =======================================================================================================================================
 */
-String version = "V1.5.24";
+#include "Globals.h"
 
-boolean north = true;    // change this to 'false' if youre in the southern hemisphere
+String version = "V1.6.32";
+
+///////////////////////////////////////////////////////////////////////////
+// Please see the Globals.h file for configuration of the firmware.
+///////////////////////////////////////////////////////////////////////////
+
+// See NORTHERN_HEMISPHERE in Globals.h if you not in the northern hemisphere
 
 // The radius of the surface that the belt runs on (in V1 of the ring) was 168.24mm.
 // Belt moves 40mm for one stepper revolution (2mm pitch, 20 teeth).
 // RA wheel is 2 x PI x 168.24mm (V2:180mm) circumference = 1057.1mm (V2:1131mm)
 // One RA revolution needs 26.43 (1057.1mm / 40mm) stepper revolutions (V2: 28.27 (1131mm/40mm))
-// Which means 108245 steps (26.43 x 4096) moves 360 degrees (V2: 115812 steps (28.27 x 4096)
+// Which means 108245 steps (26.43 x 4096) moves 360 degrees (V2: 115812 steps (28.27 x 4096))
 // So there are 300.1 steps/degree (108245 / 360)  (V2: 322 (115812 / 360))
+// Theoretically correct RA tracking speed is 1.246586 (300 x 14.95903 / 3600) (V2 : 1.333800 (322 x 14.95903 / 3600) steps/sec
+#error "Please uncomment one of the two following lines depending on which version of the RA ring you printed. And comment out this line."
+// int RAStepsPerDegree = 300;      // V1 Ring has a ridge on top of the ring that the belt runs on and the ring runs on the bearings
+// int RAStepsPerDegree = 322;      // V2 Ring has belt in a groove and belt runs on bearings
 
-int RAStepsPerDegree = 300;      // V1 Ring has a ridge that the belt runs on and the ring runs on the bearings
-// int RAStepsPerDegree = 322;      // V2 Ring has belt in a groove and runs on bearings
 
 // Belt moves 40mm for one stepper revolution (2mm pitch, 20 teeth).
 // DEC wheel is 2 x PI x 90mm circumference which is 565.5mm
@@ -48,6 +56,7 @@ int DECacceleration = 400;
 
 // Define some stepper limits to prevent physical damage to the tracker. This assumes that the home
 // point (zero point) has been correctly set to be pointing at the celestial pole.
+// Note: these are currently not used
 float RAStepperLimit = 15500;         // Going much more than this each direction will make the ring fall off the bearings.
 
 // These are for 47N, so they will need adjustment if you're a lot away from that.
@@ -55,23 +64,15 @@ float RAStepperLimit = 15500;         // Going much more than this each directio
 // down until my lens was horizontal. Note the DEC number. Then move it up until
 // the lens is horizontal and note that number. Put those here. Always watch your
 // tracker and hit RESET if it approaches a dangerous area.
+// Note: these are currently not used
 float DECStepperDownLimit = 10000;    // Going much more than this will make the lens collide with the ring
 float DECStepperUpLimit = -22000;     // Going much more than this is going below the horizon.
 
 // These values are needed to calculate the current position during initial alignment.
-int h = 21;
-int m = 2;
-int s = 25;
-// You get these values by calculating 24h minus the current (not J2000) RA of Polaris.
+int PolarisRAHour = 2;
+int PolarisRAMinute = 58;
+int PolarisRASecond = 0;
+// Use something like Stellarium to look up the RA of Polaris in JNow (on date) variant.
 // This changes slightly over weeks, so adjust every couple of months.
-// This value is from 27.Nov.19, I suggest next adjustment in mid 2020
+// This value is from 18.Apr.2020, next adjustment suggested at end 2020
 // The same could be done for the DEC coordinates but they dont change significantly for the next 5 years
-
-// Comment this out to save some code space
-// #define DEBUG_MODE
-
-// Uncomment this to support the heating menu
-// #define SUPPORT_HEATING
-
-// Uncomment to run a key diagnostic
-// #define LCD_BUTTON_TEST

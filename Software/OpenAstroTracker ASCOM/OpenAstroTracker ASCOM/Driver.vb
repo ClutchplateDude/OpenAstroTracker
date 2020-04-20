@@ -6,24 +6,11 @@ Imports System.Threading
 ' ASCOM Telescope driver for OpenAstroTracker
 '
 ' Implements:	ASCOM Telescope interface version: 1.0
-' Author:		(EOR) EorEquis@tristarobservatory.space
 '
-' Edit Log:
+' Driver ID : ASCOM.OpenAstroTracker.Telescope
 '
-' Date			Who	Vers	Description
-' -----------	---	-----	-------------------------------------------------------
-' 2020-03-28	EOR	1.0.0	Initial edit, from Telescope template
-' ---------------------------------------------------------------------------------
-'
-'
-' Your driver's ID is ASCOM.OpenAstroTracker.Telescope
-'
-' The Guid attribute sets the CLSID for ASCOM.DeviceName.Telescope
-' The ClassInterface/None addribute prevents an empty interface called
-' _Telescope from being created and used as the [default] interface
-'
-
 ' This definition is used to select code that's only applicable for one device type
+'
 #Const Device = "Telescope"
 
 Imports ASCOM
@@ -31,6 +18,7 @@ Imports ASCOM.Astrometry
 Imports ASCOM.Astrometry.AstroUtils
 Imports ASCOM.DeviceInterface
 Imports ASCOM.Utilities
+Imports ASCOM.Astrometry.Transform
 
 Imports System
 Imports System.Collections
@@ -47,32 +35,47 @@ Public Class Telescope
     ' The ClassInterface/None addribute prevents an empty interface called
     ' _OpenAstroTracker from being created and used as the [default] interface
 
-    ' TODO Replace the not implemented exceptions with code to implement the function or
-    ' throw the appropriate ASCOM exception.
-    '
     Implements ITelescopeV3
 
     '
     ' Driver ID and descriptive string that shows in the Chooser
     '
+    Private Version As String = "0.1.4.1b"
     Friend Shared driverID As String = "ASCOM.OpenAstroTracker.Telescope"
     Private Shared driverDescription As String = "OpenAstroTracker Telescope"
 
     Friend Shared comPortProfileName As String = "COM Port" 'Constants used for Profile persistence
     Friend Shared traceStateProfileName As String = "Trace Level"
+    Friend Shared latitudeProfileName As String = "Latitude"
+    Friend Shared longitudeProfileName As String = "Longitude"
+    Friend Shared elevationProfileName As String = "Elevation"
+
     Friend Shared comPortDefault As String = "COM1"
     Friend Shared traceStateDefault As String = "False"
+    Friend Shared latitudeDefault As Double = 39.8283
+    Friend Shared longitudeDefault As Double = -98.5795
+    Friend Shared elevationDefault As Integer = 1
 
     Friend Shared comPort As String ' Variables to hold the currrent device configuration
     Friend Shared portNum As String
     Friend Shared traceState As Boolean
+    Friend Shared latitude As Double
+    Friend Shared longitude As Double
+    Friend Shared elevation As Integer
+    Friend Shared PolarisRAJNow As Double = 0.0
+
 
     Private connectedState As Boolean ' Private variable to hold the connected state
     Private utilities As Util ' Private variable to hold an ASCOM Utilities object
     Private astroUtilities As AstroUtils ' Private variable to hold an AstroUtils object to provide the Range method
     Private TL As TraceLogger ' Private variable to hold the trace logger object (creates a diagnostic log file with information that you specify)
     Private objSerial As ASCOM.Utilities.Serial
-    Private isParked As Boolean = False
+    Public transform As ASCOM.Astrometry.Transform.Transform
+    Private connWait As Boolean = False     ' This is a lame hack to be able to transmit things w/ CommandString before we set connected to true.
+
+    Private isParked As Boolean = False, isTracking As Boolean = True
+    Private targetRA As Double, targetDec As Double, targetRASet As Boolean = False, targetDecSet As Boolean = False
+    Dim mutexBlind As Mutex, mutexCommand As Mutex
 
     '
     ' Constructor - Must be public for COM registration!
@@ -82,15 +85,21 @@ Public Class Telescope
         ReadProfile() ' Read device configuration from the ASCOM Profile store
         TL = New TraceLogger("", "OpenAstroTracker")
         TL.Enabled = traceState
-        TL.LogMessage("Telescope", "Starting initialisation")
+        TL.LogMessage("Telescope", "Starting initialization")
 
         connectedState = False ' Initialise connected to false
         utilities = New Util() ' Initialise util object
         astroUtilities = New AstroUtils 'Initialise new astro utiliites object
 
         'TODO: Implement your additional construction here
-
-        TL.LogMessage("Telescope", "Completed initialisation")
+        mutexCommand = New Mutex(False, "CommMutex")
+        transform = New Transform
+        transform.SetJ2000(utilities.HMSToHours("02:31:51.12"), utilities.DMSToDegrees("89:15:51.4"))
+        transform.SiteElevation = SiteElevation
+        transform.SiteLatitude = SiteLatitude
+        transform.SiteLongitude = SiteLongitude
+        PolarisRAJNow = transform.RATopocentric
+        TL.LogMessage("Telescope", "Completed initialization")
     End Sub
 
     '
@@ -123,14 +132,13 @@ Public Class Telescope
         Get
             Dim actionList As New ArrayList
             actionList.Add("Telescope:getFirmwareVer")
+            actionList.Add("Utility:JNowtoJ2000")
             TL.LogMessage("SupportedActions Get", "Returning arraylist of " + actionList.Count.ToString + " item(s)")
             Return actionList
-            '            Return New ArrayList()
         End Get
     End Property
 
     Public Function Action(ByVal ActionName As String, ByVal ActionParameters As String) As String Implements ITelescopeV3.Action
-        ' We may throw heater control into here, if we ever get there.
         Dim suppAct As ArrayList = SupportedActions()
         If suppAct.Contains(ActionName) Then
             Dim retVal As String = "255"        ' Default error code
@@ -138,8 +146,11 @@ Public Class Telescope
                 Case "Telescope:getFirmwareVer"
                     retVal = CommandString(":GVP")                  ' Get firmware name
                     retVal = retVal + " " + CommandString(":GVN")   ' Get firmware version number
-                    TL.LogMessage("Action(" + ActionName + ", " + ActionParameters + ")", retVal)
+                Case "Utility:JNowtoJ2000"
+                    transform.SetTopocentric(CDbl(ActionParameters.Split(",")(0)), CDbl(ActionParameters.Split(",")(1)))
+                    retVal = utilities.HoursToHMS(transform.RAJ2000, ":", ":", String.Empty) + "&" + utilities.DegreesToDMS(transform.DecJ2000, "*", ":", String.Empty)
             End Select
+            TL.LogMessage("Action(" + ActionName + ", " + ActionParameters + ")", retVal)
             Return retVal
         Else
             Throw New ActionNotImplementedException("Action " & ActionName & " is not supported by this driver")
@@ -148,10 +159,11 @@ Public Class Telescope
     End Function
 
     Public Sub CommandBlind(ByVal Command As String, Optional ByVal Raw As Boolean = False) Implements ITelescopeV3.CommandBlind
-        CheckConnected("CommandBlind")
-        Dim webMutex As Mutex   ' Very simple multithreading for now.
-        webMutex = New Mutex(False, "RRMutex")
-        webMutex.WaitOne()
+        If Not connWait Then
+            CheckConnected("CommandBlind")
+        End If
+        mutexCommand.WaitOne()
+
         If Not Raw Then
             Command = Command + "#"
         End If
@@ -161,26 +173,25 @@ Public Class Telescope
         Catch ex As Exception
             TL.LogMessage("CommandBlind(" + Command + ")", "Error : " + ex.Message)
         Finally
-            webMutex.ReleaseMutex()
+            mutexCommand.ReleaseMutex()
         End Try
     End Sub
 
     Public Function CommandBool(ByVal Command As String, Optional ByVal Raw As Boolean = False) As Boolean _
         Implements ITelescopeV3.CommandBool
-        CheckConnected("CommandBool")
-        Dim ret As String = CommandString(Command, Raw)
+        'CheckConnected("CommandBool")
+        'Dim ret As String = CommandString(Command, Raw)
         ' TODO decode the return string and return true or false
-        ' or
         Throw New MethodNotImplementedException("CommandBool")
     End Function
 
     Public Function CommandString(ByVal Command As String, Optional ByVal Raw As Boolean = False) As String _
         Implements ITelescopeV3.CommandString
         Dim response As String
-        CheckConnected("CommandString")
-        Dim webMutex As Mutex   ' Very simple multithreading for now.
-        webMutex = New Mutex(False, "RRMutex")
-        webMutex.WaitOne()
+        If Not connWait Then
+            CheckConnected("CommandString")
+        End If
+        mutexCommand.WaitOne()
         If Not Raw Then
             Command = Command + "#"
         End If
@@ -189,10 +200,12 @@ Public Class Telescope
             TL.LogMessage("CommandString", "Transmitted " & Command)
             Dim cmdGroup As String = Command.Substring(1, 1)
             Select Case cmdGroup
-                Case "S"
+                Case "S", "M", "h", "Q"
                     response = objSerial.ReceiveCounted(1)
-                Case "M"
-                    response = objSerial.ReceiveCounted(1)
+                    'Case "M"
+                    '    response = objSerial.ReceiveCounted(1)
+                    'Case "h"
+                    '    response = objSerial.ReceiveCounted(1)
                 Case Else
                     response = objSerial.ReceiveTerminated("#")
                     response = response.Replace("#", "")
@@ -203,7 +216,7 @@ Public Class Telescope
             TL.LogMessage("CommandString(" + Command + ")", ex.Message)
             Return "255"
         Finally
-            webMutex.ReleaseMutex()
+            mutexCommand.ReleaseMutex()
         End Try
     End Function
 
@@ -213,32 +226,46 @@ Public Class Telescope
             Return IsConnected
         End Get
         Set(value As Boolean)
-            '            TL.LogMessage("Connected Set", value.ToString())
+
             If value = IsConnected Then
                 Return
             End If
 
             If value Then
                 Try
-                    connectedState = True
+                    connWait = True
                     portNum = Right(comPort, Len(comPort) - 3)
                     objSerial = New ASCOM.Utilities.Serial
                     objSerial.Port = CInt(portNum)
                     objSerial.Speed = SerialSpeed.ps57600
+                    ' Default of 5s is too high.  THis will have to be managed, however, for synced commands that take longer (:hP most notably)
+                    objSerial.ReceiveTimeout = 2
                     objSerial.Connected = True
                     Thread.Sleep(2000)      ' Disgusting hack to work around arduino resetting when connected.
                     ' I don't know of any way to poll and see if the reset has completed
-                    CommandBlind(":I")
+                    CommandBlind(":I")      ' OAT's command for entering PC Control mode
+                    If SiderealTime - PolarisRAJNow < 0 Then
+                        CommandString(":SH" + utilities.HoursToHM(24 + (SiderealTime - PolarisRAJNow)), False)
+                    Else
+                        CommandString(":SH" + utilities.HoursToHM(SiderealTime - PolarisRAJNow), False)
+                    End If
+                    Dim sign As String = "+"
+                    If SiteLatitude < 0 Then
+                        sign = "-"
+                    End If
+                    CommandString(":SY" + sign + utilities.DegreesToDMS(90, "*", ":", String.Empty) + "." + utilities.HoursToHMS(SiderealTime, ":", ":"), False)
                     TL.LogMessage("Connected Set", "Connecting to port " + comPort)
-
+                    connWait = False
+                    connectedState = True
                 Catch ex As Exception
+                    Throw New ASCOM.DriverException(ex.Message)
                     TL.LogMessage("Connected Set", "Error Connecting to port " + comPort + " - " + ex.Message)
                 End Try
 
             Else
 
                 Try
-                    CommandBlind(":Qq")
+                    CommandBlind(":Qq")     ' OAT's command for exiting PC Control mode
                     Thread.Sleep(1000)
                     objSerial.Connected = False
                     connectedState = False
@@ -263,9 +290,9 @@ Public Class Telescope
 
     Public ReadOnly Property DriverInfo As String Implements ITelescopeV3.DriverInfo
         Get
-            Dim m_version As Version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version
-            ' TODO customise this driver description
-            Dim s_driverInfo As String = "OpenAstroTracker ASCOM driver version: " + m_version.Major.ToString() + "." + m_version.Minor.ToString() + "." + m_version.Build.ToString()
+            '            Dim m_version As Version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version
+            '           Dim s_driverInfo As String = "OpenAstroTracker ASCOM driver version: " + m_version.Major.ToString() + "." + m_version.Minor.ToString() + "." + m_version.Build.ToString()
+            Dim s_driverInfo As String = "OpenAstroTracker ASCOM driver version: " + Version
             TL.LogMessage("DriverInfo Get", s_driverInfo)
             Return s_driverInfo
         End Get
@@ -273,9 +300,11 @@ Public Class Telescope
 
     Public ReadOnly Property DriverVersion() As String Implements ITelescopeV3.DriverVersion
         Get
-            ' Get our own assembly and report its version number
-            TL.LogMessage("DriverVersion Get", Reflection.Assembly.GetExecutingAssembly.GetName.Version.ToString(2))
-            Return Reflection.Assembly.GetExecutingAssembly.GetName.Version.ToString(2)
+            TL.LogMessage("DriverVersion Get", Version)
+            Return Version
+
+            ' TL.LogMessage("DriverVersion Get", Reflection.Assembly.GetExecutingAssembly.GetName.Version.ToString(2))
+            ' Return Reflection.Assembly.GetExecutingAssembly.GetName.Version.ToString(2)
         End Get
     End Property
 
@@ -309,16 +338,19 @@ Public Class Telescope
 
 #Region "ITelescope Implementation"
     Public Sub AbortSlew() Implements ITelescopeV3.AbortSlew
-        'TODO : We really should be able to abort
-        TL.LogMessage("AbortSlew", "Not implemented")
-        Throw New ASCOM.MethodNotImplementedException("AbortSlew")
+        If Not AtPark Then
+            CommandString(":Q")
+            TL.LogMessage("AbortSlew", ":Q# Sent")
+        Else
+            Throw New ASCOM.ParkedException("AbortSlew")
+        End If
+
     End Sub
 
     Public ReadOnly Property AlignmentMode() As AlignmentModes Implements ITelescopeV3.AlignmentMode
         Get
             TL.LogMessage("AlignmentMode Get", "1")
-            Return 1
-            ' Throw New ASCOM.PropertyNotImplementedException("AlignmentMode", False)
+            Return 1        ' 1 is "Polar (equatorial) mount other than German equatorial." from AlignmentModes Enumeration
         End Get
     End Property
 
@@ -354,16 +386,12 @@ Public Class Telescope
 
     Public ReadOnly Property AtPark() As Boolean Implements ITelescopeV3.AtPark
         Get
-            'Must be implemented, must not throw a PropertyNotImplementedException.
-            'If the telescope cannot be parked, then AtPark must always return False.
             TL.LogMessage("AtPark", "Get - " & isParked.ToString())
-            Return isParked
+            Return isParked     ' Custom boolean we added to track parked state
         End Get
     End Property
 
     Public Function AxisRates(Axis As TelescopeAxes) As IAxisRates Implements ITelescopeV3.AxisRates
-        'Must be implemented, must not throw a MethodNotImplementedException.
-        'See the description of MoveAxis(TelescopeAxes, Double) for more information. This method must return an empty collection if MoveAxis(TelescopeAxes, Double) is not supported.
         TL.LogMessage("AxisRates", "Get - " & Axis.ToString())
         Return New AxisRates(Axis)
     End Function
@@ -408,8 +436,8 @@ Public Class Telescope
 
     Public ReadOnly Property CanPulseGuide() As Boolean Implements ITelescopeV3.CanPulseGuide
         Get
-            TL.LogMessage("CanPulseGuide", "Get - " & False.ToString())
-            Return False
+            TL.LogMessage("CanPulseGuide", "Get - " & True.ToString())
+            Return True
         End Get
     End Property
 
@@ -428,6 +456,7 @@ Public Class Telescope
     End Property
 
     Public ReadOnly Property CanSetPark() As Boolean Implements ITelescopeV3.CanSetPark
+        'ToDo  We should allow this
         Get
             TL.LogMessage("CanSetPark", "Get - " & False.ToString())
             Return False
@@ -450,8 +479,8 @@ Public Class Telescope
 
     Public ReadOnly Property CanSetTracking() As Boolean Implements ITelescopeV3.CanSetTracking
         Get
-            TL.LogMessage("CanSetTracking", "Get - " & False.ToString())
-            Return False
+            TL.LogMessage("CanSetTracking", "Get - " & True.ToString())
+            Return True
         End Get
     End Property
 
@@ -463,6 +492,7 @@ Public Class Telescope
     End Property
 
     Public ReadOnly Property CanSlewAltAz() As Boolean Implements ITelescopeV3.CanSlewAltAz
+        ' TODO - AltAz slewing
         Get
             TL.LogMessage("CanSlewAltAz", "Get - " & False.ToString())
             Return False
@@ -485,8 +515,8 @@ Public Class Telescope
 
     Public ReadOnly Property CanSync() As Boolean Implements ITelescopeV3.CanSync
         Get
-            TL.LogMessage("CanSync", "Get - " & False.ToString())
-            Return False
+            TL.LogMessage("CanSync", "Get - " & True.ToString())
+            Return True
         End Get
     End Property
 
@@ -507,7 +537,7 @@ Public Class Telescope
     Public ReadOnly Property Declination() As Double Implements ITelescopeV3.Declination
         Get
             Dim declination__1 As Double = 0.0
-            Dim scopeDec As String = CommandString(":Gd")   ' TODO : Change this to :GD once implemented in firmware
+            Dim scopeDec As String = CommandString(":GD")
             TL.LogMessage("Declination", "Get - " & scopeDec)
             declination__1 = utilities.DMSToDegrees(scopeDec)
             Return declination__1
@@ -543,6 +573,7 @@ Public Class Telescope
     End Property
 
     Public ReadOnly Property EquatorialSystem() As EquatorialCoordinateType Implements ITelescopeV3.EquatorialSystem
+        'TODO : Determine if we're using JNow or J2000, or can use both.  Work on this.
         Get
             Dim equatorialSystem__1 As EquatorialCoordinateType = EquatorialCoordinateType.equTopocentric
             TL.LogMessage("DeclinationRate", "Get - " & equatorialSystem__1.ToString())
@@ -586,35 +617,53 @@ Public Class Telescope
 
     Public ReadOnly Property IsPulseGuiding() As Boolean Implements ITelescopeV3.IsPulseGuiding
         Get
-            TL.LogMessage("IsPulseGuiding Get", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("IsPulseGuiding", False)
+            Dim retVal As Boolean = Convert.ToBoolean(CInt(CommandString(":GIG")))
+            TL.LogMessage("isPulseGuiding Get", retVal.ToString)
+            Return retVal
         End Get
     End Property
 
     Public Sub MoveAxis(Axis As TelescopeAxes, Rate As Double) Implements ITelescopeV3.MoveAxis
+        'TODO This is coming
         TL.LogMessage("MoveAxis", "Not implemented")
         Throw New ASCOM.MethodNotImplementedException("MoveAxis")
     End Sub
 
     Public Sub Park() Implements ITelescopeV3.Park
-        TL.LogMessage("Park", "Park requested")
-        CommandBlind(":hP")
-        ' CommandBlind(":Q")
-        isParked = True
+        If Not AtPark Then
+            '    TL.LogMessage("Park", "Err : Mount already parked")
+            '    Throw New ASCOM.ParkedException("Already Parked")
+            'Else
+            CommandString(":hP", False)
+            PollUntilZero(":GIS")
+            isParked = True
+            TL.LogMessage("Park", "Parked mount")
+        End If
+
     End Sub
 
     Public Sub PulseGuide(Direction As GuideDirections, Duration As Integer) Implements ITelescopeV3.PulseGuide
-        TL.LogMessage("PulseGuide", "Not implemented")
-        Throw New ASCOM.MethodNotImplementedException("PulseGuide")
+        If Not AtPark Then
+            TL.LogMessage("PulseGuide", Direction.ToString + " " + Duration.ToString)
+            Dim dir As String, length As String, pgCmd As String = ":MG"
+            dir = Direction.ToString.Substring(5, 1)
+            length = Right("0000" + Duration.ToString, 4)
+            pgCmd = pgCmd + dir + length
+            CommandBlind(pgCmd, False)
+        Else
+            TL.LogMessage("PulseGuide", "Parked")
+            Throw New ASCOM.ParkedException("PulseGuide")
+        End If
     End Sub
 
     Public ReadOnly Property RightAscension() As Double Implements ITelescopeV3.RightAscension
         Get
+
             Dim rightAscension__1 As Double = 0.0
-            Dim scopeRA As String = CommandString(":Gr")   ' TODO : Change this to :GR once implemented in firmware
-            TL.LogMessage("RightAscension", "Get - " + scopeRA)
-            rightAscension__1 = utilities.HMSToHours(scopeRA)
+            rightAscension__1 = utilities.HMSToHours(CommandString(":GR"))
+            TL.LogMessage("RightAscension", rightAscension__1.ToString)
             Return rightAscension__1
+
         End Get
     End Property
 
@@ -637,16 +686,31 @@ Public Class Telescope
 
     Public Property SideOfPier() As PierSide Implements ITelescopeV3.SideOfPier
         Get
-            TL.LogMessage("SideOfPier Get", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("SideOfPier", False)
+            Dim retVal As PierSide
+            If SiderealTime < 12 Then
+                If RightAscension >= SiderealTime And RightAscension <= SiderealTime + 12 Then
+                    retVal = PierSide.pierWest
+                Else
+                    retVal = PierSide.pierEast
+                End If
+            Else
+                If RightAscension <= SiderealTime And RightAscension >= SiderealTime - 12 Then
+                    retVal = PierSide.pierEast
+                Else
+                    retVal = PierSide.pierWest
+                End If
+            End If
+            TL.LogMessage("SideOfPier Get", retVal.ToString)
+            Return retVal
         End Get
         Set(value As PierSide)
-            TL.LogMessage("SideOfPier Set", "Not implemented")
+            TL.LogMessage("SideOfPier Set", "Not Implemented")
             Throw New ASCOM.PropertyNotImplementedException("SideOfPier", True)
         End Set
     End Property
 
     Public ReadOnly Property SiderealTime() As Double Implements ITelescopeV3.SiderealTime
+
         Get
             ' now using novas 3.1
             Dim lst As Double = 0.0
@@ -672,19 +736,23 @@ Public Class Telescope
 
     Public Property SiteElevation() As Double Implements ITelescopeV3.SiteElevation
         Get
-            TL.LogMessage("SiteElevation Get", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("SiteElevation", False)
+            TL.LogMessage("SiteElevation Get", elevation.ToString)
+            Return elevation
         End Get
         Set(value As Double)
-            TL.LogMessage("SiteElevation Set", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("SiteElevation", True)
+            If value >= -300 And value <= 10000 Then
+                TL.LogMessage("SiteElevation Set", value.ToString)
+                elevation = value
+            Else
+                Throw New ASCOM.InvalidValueException("SiteElevation")
+            End If
         End Set
     End Property
 
     Public Property SiteLatitude() As Double Implements ITelescopeV3.SiteLatitude
         Get
-            TL.LogMessage("SiteLatitude Get", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("SiteLatitude", False)
+            TL.LogMessage("SiteLatitude Get", latitude.ToString)
+            Return latitude
         End Get
         Set(value As Double)
             TL.LogMessage("SiteLatitude Set", "Not implemented")
@@ -694,8 +762,8 @@ Public Class Telescope
 
     Public Property SiteLongitude() As Double Implements ITelescopeV3.SiteLongitude
         Get
-            TL.LogMessage("SiteLongitude Get", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("SiteLongitude", False)
+            TL.LogMessage("SiteLongitude Get", longitude.ToString)
+            Return longitude
         End Get
         Set(value As Double)
             TL.LogMessage("SiteLongitude Set", "Not implemented")
@@ -725,51 +793,82 @@ Public Class Telescope
     End Sub
 
     Public Sub SlewToCoordinates(RightAscension As Double, Declination As Double) Implements ITelescopeV3.SlewToCoordinates
-        If Not AtPark Then
-            TL.LogMessage("SlewToCoordinates", "RA " + RightAscension.ToString + ", Dec " + Declination.ToString)
-            Dim strRAcmd = ":Sr" + utilities.HoursToHMS(RightAscension, ":", ":")
-            Dim strDeccmd = utilities.DegreesToDMS(Declination, "*", ":")
-            If Declination < 0 Then
-                strDeccmd = "-" + strDeccmd
-            Else
-                strDeccmd = "+" + strDeccmd
-            End If
-            strDeccmd = ":Sd" + strDeccmd
-            TL.LogMessage("SlewToCoordinatesRACmd", strRAcmd)
-            TL.LogMessage("SlewToCoordinatesDecCmd", strDeccmd)
-            If CommandString(strRAcmd) = "1" Then
-                If CommandString(strDeccmd) = "1" Then
-                    CommandString(":MS")
-                End If
+        ' Synchronous slew to given coordinates.  Uses PollUntilZero to wait for slew to finish
+        If RightAscension <= 24 And RightAscension >= 0 And Declination >= -90 And Declination <= 90 Then
 
+            If Not AtPark Then
+                TL.LogMessage("SlewToCoordinates", "RA " + RightAscension.ToString + ", Dec " + Declination.ToString)
+                Dim strRAcmd = ":Sr" + utilities.HoursToHMS(RightAscension, ":", ":")
+                Dim strDeccmd = utilities.DegreesToDMS(Declination, "*", ":", "")
+                If Declination >= 0 Then
+                    strDeccmd = "+" + strDeccmd
+                End If
+                strDeccmd = ":Sd" + strDeccmd
+                TL.LogMessage("SlewToCoordinatesRACmd", strRAcmd)
+                TL.LogMessage("SlewToCoordinatesDecCmd", strDeccmd)
+                If CommandString(strRAcmd) = "1" Then
+                    If CommandString(strDeccmd) = "1" Then
+                        CommandString(":MS")
+                        PollUntilZero(":GIS")
+                    End If
+
+                End If
+            Else
+                TL.LogMessage("SlewToCoordinates", "Parked")
+                Throw New ASCOM.ParkedException("SlewToCoordinates")
             End If
         Else
-            TL.LogMessage("SlewToCoordinates", "Parked")
-            Throw New ASCOM.ParkedException("SlewToCoordinates")
+            TL.LogMessage("SlewToCoordinates", "Invalid coordinates RA: " + RightAscension.ToString + ", Dec: " + Declination.ToString)
+            Throw New ASCOM.InvalidValueException("SlewToCoordinates")
         End If
-
-
     End Sub
 
     Public Sub SlewToCoordinatesAsync(RightAscension As Double, Declination As Double) Implements ITelescopeV3.SlewToCoordinatesAsync
-        TL.LogMessage("SlewToCoordinatesAsync", "Not implemented")
-        Throw New ASCOM.MethodNotImplementedException("SlewToCoordinatesAsync")
+        ' ASynchronous slew to coordinates.  Returns immediately after receiving response from :MS that command was accepted
+        If RightAscension <= 24 And RightAscension >= 0 And Declination >= -90 And Declination <= 90 Then
+
+            If Not AtPark Then
+                TL.LogMessage("SlewToCoordinatesAsync", "RA " + RightAscension.ToString + ", Dec " + Declination.ToString)
+                Dim strRAcmd = ":Sr" + utilities.HoursToHMS(RightAscension, ":", ":")
+                Dim strDeccmd = utilities.DegreesToDMS(Declination, "*", ":", "")
+                If Declination >= 0 Then
+                    strDeccmd = "+" + strDeccmd
+                End If
+                strDeccmd = ":Sd" + strDeccmd
+                TL.LogMessage("SlewToCoordinatesAsyncRACmd", strRAcmd)
+                TL.LogMessage("SlewToCoordinatesAsyncDecCmd", strDeccmd)
+                If CommandString(strRAcmd) = "1" Then
+                    If CommandString(strDeccmd) = "1" Then
+                        CommandString(":MS")
+                    End If
+
+                End If
+            Else
+                TL.LogMessage("SlewToCoordinatesAsync", "Parked")
+                Throw New ASCOM.ParkedException("SlewToCoordinatesAsync")
+            End If
+        Else
+            TL.LogMessage("SlewToCoordinatesAsync", "Invalid coordinates RA: " + RightAscension.ToString + ", Dec: " + Declination.ToString)
+            Throw New ASCOM.InvalidValueException("SlewToCoordinatesAsync")
+        End If
+
     End Sub
 
     Public Sub SlewToTarget() Implements ITelescopeV3.SlewToTarget
-        TL.LogMessage("SlewToTarget", "Not implemented")
-        Throw New ASCOM.MethodNotImplementedException("SlewToTarget")
+        TL.LogMessage("SlewToTarget", TargetRightAscension.ToString + ", " + TargetDeclination.ToString)
+        SlewToCoordinates(TargetRightAscension, TargetDeclination)
     End Sub
 
     Public Sub SlewToTargetAsync() Implements ITelescopeV3.SlewToTargetAsync
-        TL.LogMessage("    Public Sub SlewToTargetAsync() Implements ITelescopeV3.SlewToTargetAsync", "Not implemented")
-        Throw New ASCOM.MethodNotImplementedException("SlewToTargetAsync")
+        TL.LogMessage("SlewToTargetAsync", TargetRightAscension.ToString + ", " + TargetDeclination.ToString)
+        SlewToCoordinatesAsync(TargetRightAscension, TargetDeclination)
     End Sub
 
     Public ReadOnly Property Slewing() As Boolean Implements ITelescopeV3.Slewing
         Get
-            TL.LogMessage("Slewing Get", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("Slewing", False)
+            Dim retVal As Boolean = Convert.ToBoolean(CInt(CommandString(":GIS")))
+            TL.LogMessage("Slewing Get", retVal.ToString)
+            Return retVal
         End Get
     End Property
 
@@ -779,59 +878,144 @@ Public Class Telescope
     End Sub
 
     Public Sub SyncToCoordinates(RightAscension As Double, Declination As Double) Implements ITelescopeV3.SyncToCoordinates
-        TL.LogMessage("SyncToCoordinates", "Not implemented")
-        Throw New ASCOM.MethodNotImplementedException("SyncToCoordinates")
+        If Not AtPark Then
+            If RightAscension <= 24 And RightAscension >= 0 And Declination >= -90 And Declination <= 90 Then
+                Dim sign As String = String.Empty
+                If Declination >= 0 Then
+                    sign = "+"
+                End If
+                Dim success As String = CommandString(":SY" + sign + utilities.DegreesToDMS(Declination, "*", ":", String.Empty) + "." + utilities.HoursToHMS(RightAscension, ":", ":"), False)
+                If success = "1" Then
+                    TL.LogMessage("SyncToCoordinates", "Synced to " + utilities.DegreesToDMS(Declination) + ", " + utilities.HoursToHMS(RightAscension))
+                Else
+                    TL.LogMessage("SyncToCoordinates", "Err - Failed to sync to " + utilities.DegreesToDMS(Declination) + ", " + utilities.HoursToHMS(RightAscension))
+                    Throw New ASCOM.DriverException("SyncToCoordinates")
+                End If
+            Else
+                TL.LogMessage("SyncToCoordinates", "Err - Invalid coordinates RA: " + RightAscension.ToString + ", Dec: " + Declination.ToString)
+                Throw New ASCOM.InvalidValueException("SyncToCoordinates")
+            End If
+        Else
+            TL.LogMessage("SyncToCoordinates", "Err - Parked")
+            Throw New ASCOM.ParkedException("SyncToCoordinates")
+        End If
+
     End Sub
 
     Public Sub SyncToTarget() Implements ITelescopeV3.SyncToTarget
-        TL.LogMessage("SyncToTarget", "Not implemented")
-        Throw New ASCOM.MethodNotImplementedException("SyncToTarget")
+        If Not AtPark Then
+            If targetDecSet Then
+
+                If targetRASet Then
+
+                    Dim sign As String = String.Empty
+                    If TargetDeclination >= 0 Then
+                        sign = "+"
+                    End If
+                    Dim success As String = CommandString(":SY" + sign + utilities.DegreesToDMS(TargetDeclination, "*", ":", String.Empty) + "." + utilities.HoursToHMS(TargetRightAscension, ":", ":"), False)
+                    If success = "1" Then
+                        TL.LogMessage("SyncToTarget", "Synced to " + utilities.DegreesToDMS(TargetDeclination) + ", " + utilities.HoursToHMS(TargetRightAscension))
+                    Else
+                        TL.LogMessage("SyncToTarget", "Failed to sync to " + utilities.DegreesToDMS(TargetDeclination) + ", " + utilities.HoursToHMS(TargetRightAscension))
+                        Throw New ASCOM.DriverException("SyncToTarget")
+                    End If
+
+                Else
+
+                    Throw New ASCOM.ValueNotSetException("TargetRightAscension")
+
+                End If
+
+            Else
+
+                Throw New ASCOM.ValueNotSetException("TargetDeclination")
+
+            End If
+        Else
+            TL.LogMessage("SyncToTarget", "Err - Parked")
+            Throw New ASCOM.ParkedException("SyncToTarget")
+        End If
+
     End Sub
 
     Public Property TargetDeclination() As Double Implements ITelescopeV3.TargetDeclination
         Get
-            Dim declination__t As Double = 0.0
-            Dim targetDec As String = CommandString(":Gd")
-            TL.LogMessage("TargetDeclination", "Get - " & targetDec)
-            declination__t = utilities.DMSToDegrees(targetDec)
-            Return declination__t
+            If targetDecSet Then
+                TL.LogMessage("TargetDeclination Get", targetDec.ToString)
+                Return targetDec
+            Else
+                TL.LogMessage("TargetDeclination Get", "Value not set")
+                Throw New ASCOM.ValueNotSetException("TargetDeclination")
+            End If
+
         End Get
         Set(value As Double)
-            TL.LogMessage("TargetDeclination Set", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("TargetDeclination", True)
+            If value >= -90 And value <= 90 Then
+                TL.LogMessage("TargetDeclination Set", value.ToString)
+                targetDec = value
+                targetDecSet = True
+            Else
+                TL.LogMessage("TargetDeclination Set", "Invalid Value " + value.ToString)
+                Throw New ASCOM.InvalidValueException("TargetDeclination")
+            End If
+
         End Set
     End Property
 
     Public Property TargetRightAscension() As Double Implements ITelescopeV3.TargetRightAscension
         Get
-            Dim rightAscension__t As Double = 0.0
-            Dim targetRA As String = CommandString(":Gr")   ' TODO : Change this to :GR once implemented in firmware
-            TL.LogMessage("TargetRightAscension", "Get - " + targetRA)
-            rightAscension__t = utilities.HMSToHours(targetRA)
-            Return rightAscension__t
+            If targetRASet Then
+                TL.LogMessage("TargetRightAscension Get", targetRA.ToString)
+                Return targetRA
+            Else
+                TL.LogMessage("TargetRightAscension Get", "Value not set")
+                Throw New ASCOM.ValueNotSetException("TargetRightAscension")
+            End If
+
         End Get
         Set(value As Double)
-            TL.LogMessage("TargetRightAscension Set", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("TargetRightAscension", True)
+            If value >= 0 And value <= 24 Then
+                TL.LogMessage("TargetRightAscension Set", value.ToString)
+                targetRA = value
+                targetRASet = True
+            Else
+                TL.LogMessage("TargetRightAscension Set", "Invalid Value " + value.ToString)
+                Throw New ASCOM.InvalidValueException("TargetRightAscension")
+            End If
+
         End Set
     End Property
 
     Public Property Tracking() As Boolean Implements ITelescopeV3.Tracking
+
         Get
-            Dim tracking__1 As Boolean = True
-            TL.LogMessage("Tracking", "Get - " & tracking__1.ToString())
-            Return tracking__1
+            If CommandString(":GIT", False) = "0" Then
+                isTracking = False
+                TL.LogMessage("Tracking", "Get - " & False.ToString())
+            Else
+                isTracking = True
+                TL.LogMessage("Tracking", "Get - " & True.ToString())
+            End If
+            Return isTracking
         End Get
         Set(value As Boolean)
-            TL.LogMessage("Tracking Set", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("Tracking", True)
+            If CommandString(":MT" + Convert.ToInt32(value).ToString, False) = "1" Then
+                isTracking = value
+                TL.LogMessage("Tracking Set", value.ToString)
+            Else
+                TL.LogMessage("Tracking Set", "Error")
+                Throw New ASCOM.DriverException("Error setting tracking state")
+            End If
+
         End Set
+
     End Property
 
     Public Property TrackingRate() As DriveRates Implements ITelescopeV3.TrackingRate
         Get
-            TL.LogMessage("TrackingRate Get", "Not implemented")
-            Throw New ASCOM.PropertyNotImplementedException("TrackingRate", False)
+            TL.LogMessage("TrackingRate Get", DriveRates.driveSidereal.ToString)
+            Return DriveRates.driveSidereal
+            ' Throw New ASCOM.PropertyNotImplementedException("TrackingRate", False)
         End Get
         Set(value As DriveRates)
             TL.LogMessage("TrackingRate Set", "Not implemented")
@@ -851,6 +1035,7 @@ Public Class Telescope
     End Property
 
     Public Property UTCDate() As DateTime Implements ITelescopeV3.UTCDate
+        ' ToDo - Can we handle this without bothering the mount?
         Get
             Dim utcDate__1 As DateTime = DateTime.UtcNow
             TL.LogMessage("UTCDate", String.Format("Get - {0}", utcDate__1))
@@ -862,8 +1047,16 @@ Public Class Telescope
     End Property
 
     Public Sub Unpark() Implements ITelescopeV3.Unpark
-        TL.LogMessage("Unpark", "Unparked mount")
-        isParked = False
+        If AtPark Then
+            '    TL.LogMessage("Unpark", "Err : Mount not parked")
+            '    Throw New ASCOM.DriverException("Mount not parked")
+            'Else
+            Dim unprkRet As String = CommandString(":hU", False)
+            If unprkRet = "1" Then
+                TL.LogMessage("Unpark", "Unparked mount")
+            End If
+            isParked = False
+        End If
     End Sub
 
 #End Region
@@ -930,6 +1123,9 @@ Public Class Telescope
             driverProfile.DeviceType = "Telescope"
             traceState = Convert.ToBoolean(driverProfile.GetValue(driverID, traceStateProfileName, String.Empty, traceStateDefault))
             comPort = driverProfile.GetValue(driverID, comPortProfileName, String.Empty, comPortDefault)
+            latitude = driverProfile.GetValue(driverID, latitudeProfileName, String.Empty, latitudeDefault)
+            longitude = driverProfile.GetValue(driverID, longitudeProfileName, String.Empty, longitudeDefault)
+            elevation = driverProfile.GetValue(driverID, elevationProfileName, String.Empty, elevationDefault)
         End Using
     End Sub
 
@@ -941,9 +1137,26 @@ Public Class Telescope
             driverProfile.DeviceType = "Telescope"
             driverProfile.WriteValue(driverID, traceStateProfileName, traceState.ToString())
             driverProfile.WriteValue(driverID, comPortProfileName, comPort.ToString())
+            driverProfile.WriteValue(driverID, latitudeProfileName, latitude.ToString())
+            driverProfile.WriteValue(driverID, longitudeProfileName, longitude.ToString())
+            driverProfile.WriteValue(driverID, elevationProfileName, elevation.ToString)
         End Using
 
     End Sub
+
+#End Region
+
+#Region "Helper Functions"
+
+    Private Function PollUntilZero(ByVal command As String) As Integer
+        ' Takes a command to be sent via CommandString, and resends every 1000ms until a 0 is returned.  Returns 0 only when complete.
+        Dim retVal As String = ""
+        Do Until retVal = "0"
+            retVal = CommandString(command, False)
+            Thread.Sleep(1000)
+        Loop
+        Return CInt(retVal)
+    End Function
 
 #End Region
 

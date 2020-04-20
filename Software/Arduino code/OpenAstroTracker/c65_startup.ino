@@ -1,3 +1,5 @@
+#ifndef HEADLESS_CLIENT
+#ifdef SUPPORT_GUIDED_STARTUP
 //////////////////////////////////////////////////////////////
 // This file contains the Starup 'wizard' that guides you through initial setup
 
@@ -22,34 +24,38 @@ void startupIsCompleted() {
 
   // Start on the RA menu
   lcdMenu.setActive(RA_Menu);
-  lcdMenu.setCursor(0, 0);
   lcdMenu.updateDisplay();
 }
 
-void processStartupKeys(int key) {
+bool processStartupKeys() {
+  byte key;
+  bool waitForRelease = true;
   switch (startupState )
   {
     case StartupIsPointedAtPole:
       {
-        if (key == btnLEFT)    {
-          isAtPole = adjustWrap(isAtPole, 1, YES, CANCEL);
-        }
-        else if (key == btnSELECT)    {
-          if (isAtPole == YES) {
-            startupState = StartupSetHATime;
+        if (lcdButtons.keyChanged(key))
+        {
+          if (key == btnLEFT)    {
+            isAtPole = adjustWrap(isAtPole, 1, YES, CANCEL);
           }
-          else if (isAtPole == NO) {
-            startupState = StartupWaitForPoleCompletion;
-            inStartup = false;
-            lcdMenu.setCursor(0, 0);
-            lcdMenu.printMenu("Use ^~<> to pole");
-            lcdMenu.setActive(Control_Menu);
+          else if (key == btnSELECT)    {
+            if (isAtPole == YES) {
+              startupState = StartupSetHATime;
+            }
+            else if (isAtPole == NO) {
+              startupState = StartupWaitForPoleCompletion;
+              inStartup = false;
+              lcdMenu.setCursor(0, 0);
+              lcdMenu.printMenu("Use ^~<> to home");
+              lcdMenu.setActive(Control_Menu);
 
-            // Skip the 'Manual control' prompt
-            inControlMode = true;
-          }
-          else if (isAtPole == CANCEL) {
-            startupIsCompleted();
+              // Skip the 'Manual control' prompt
+              inControlMode = true;
+            }
+            else if (isAtPole == CANCEL) {
+              startupIsCompleted();
+            }
           }
         }
       }
@@ -64,7 +70,6 @@ void processStartupKeys(int key) {
         lcdMenu.printMenu("Set current HA");
         lcdMenu.setActive(HA_Menu);
         startupState = StartupWaitForHACompletion;
-
       }
       break;
 
@@ -81,10 +86,12 @@ void processStartupKeys(int key) {
       }
       break;
   }
+  return waitForRelease;
 }
 
 
 void prinStartupMenu() {
+
   switch (startupState)
   {
     case StartupIsPointedAtPole:
@@ -104,7 +111,7 @@ void prinStartupMenu() {
           choices.setCharAt(15, '<');
         }
         lcdMenu.setCursor(0, 0);
-        lcdMenu.printMenu("Pointed at pole?");
+        lcdMenu.printMenu("Home position?");
         lcdMenu.setCursor(0, 1);
         lcdMenu.printMenu(choices);
       }
@@ -115,3 +122,5 @@ void prinStartupMenu() {
       break;
   }
 }
+#endif
+#endif
